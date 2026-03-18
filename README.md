@@ -50,7 +50,7 @@ This project was built using modern tools and architecture practices:
 ## 🚀 How to Run This Project
 
 1. **Clone the repository**
-   `git clone https://github.com/hearts4skypurr/Moderation-Bot.git`
+   `git clone https://github.com/hearts4skypurr/Moderation-Bot-EN.git`
 
 2. **Install dependencies**
    `npm install`
