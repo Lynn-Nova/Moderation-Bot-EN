@@ -1,13 +1,18 @@
 /**
  * @file warnings.js
- * @description Slash command for warning management.
+ * @description Moderation command module for issuing and viewing warnings.
  *
- * Implementation details:
- * - uses one command with subcommands instead of duplicated modules
- * - keeps persistence concerns close to model helpers
- * - gracefully handles DM delivery
- * - formats moderation history for audit readability
- * - defers the interaction early to prevent timeout-related failures
+ * Core responsibilities:
+ * - Provide a unified interface for warning management (add + list)
+ * - Persist moderation actions through the GuildUser model
+ * - Format warning history for human-readable audit output
+ * - Notify users of warnings via direct message (best-effort)
+ *
+ * Design principles:
+ * - Uses subcommands to avoid fragmented command structure
+ * - Delegates validation and mutation logic to the model layer
+ * - Ensures interaction lifecycle compliance via early deferral
+ * - Prioritizes audit clarity and traceability in output formatting
  */
 
 const {
@@ -18,6 +23,23 @@ const {
 } = require("discord.js")
 const GuildUser = require("../models/GuildUser")
 
+/**
+ * Formats a list of warning objects into a readable embed description.
+ *
+ * Output structure:
+ * Each warning entry includes:
+ * - Sequential ID (1-based index)
+ * - Reason for the warning
+ * - Moderator responsible (resolved as mention if possible)
+ * - Relative timestamp (Discord-formatted)
+ *
+ * Implementation details:
+ * - Uses Discord's <t:timestamp:R> format for relative time display
+ * - Handles missing data gracefully (fallback values)
+ *
+ * @param {Array<Object>} warnings
+ * @returns {string}
+ */
 function buildWarningListDescription(warnings = []) {
 	return warnings
 		.map((warning, index) => {
@@ -39,6 +61,22 @@ function buildWarningListDescription(warnings = []) {
 		.join("\n\n")
 }
 
+/**
+ * Sends a direct message to the warned user.
+ *
+ * Behavior:
+ * - Constructs a structured embed describing the warning
+ * - Includes guild context, reason, and moderator identity
+ *
+ * Failure handling:
+ * - This function does NOT handle errors internally
+ * - Caller is responsible for catching failures (e.g., DMs disabled)
+ *
+ * @param {User} target
+ * @param {string} guildName
+ * @param {string} moderatorTag
+ * @param {string} reason
+ */
 async function notifyTargetUser(target, guildName, moderatorTag, reason) {
 	const dmEmbed = new EmbedBuilder()
 		.setTitle("⚠️ Warning Received")
@@ -54,6 +92,16 @@ async function notifyTargetUser(target, guildName, moderatorTag, reason) {
 }
 
 module.exports = {
+	/**
+	 * Slash command definition using subcommands.
+	 *
+	 * Subcommands:
+	 * - add: issues a new warning
+	 * - list: retrieves warning history
+	 *
+	 * Permission model:
+	 * Restricted to members with moderation privileges.
+	 */
 	data: new SlashCommandBuilder()
 		.setName("warn")
 		.setDescription("Warning management command set.")
@@ -87,6 +135,22 @@ module.exports = {
 				),
 		),
 
+	/**
+	 * Main execution handler for warning operations.
+	 *
+	 * Execution flow:
+	 * 1. Defer interaction (prevents Discord timeout)
+	 * 2. Determine subcommand type
+	 * 3. Route to appropriate logic branch (add or list)
+	 * 4. Interact with persistence layer
+	 * 5. Format and return response
+	 *
+	 * Error handling:
+	 * - Wrapped in try/catch to prevent crashes
+	 * - Adapts response method based on interaction state
+	 *
+	 * @param {CommandInteraction} interaction
+	 */
 	async execute(interaction) {
 		try {
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral })
@@ -95,6 +159,15 @@ module.exports = {
 			const target = interaction.options.getUser("target")
 			const guildId = interaction.guild.id
 
+			/**
+			 * ADD WARNING FLOW
+			 *
+			 * Responsibilities:
+			 * - Normalize input reason
+			 * - Persist warning
+			 * - Attempt DM notification
+			 * - Return confirmation embed
+			 */
 			if (subcommand === "add") {
 				const reason = GuildUser.normalizeReason(
 					interaction.options.getString("reason"),
@@ -111,6 +184,10 @@ module.exports = {
 						reason,
 					)
 				} catch {
+					/**
+					 * DM failures are expected (privacy settings).
+					 * Logging is sufficient; execution continues normally.
+					 */
 					console.log(`DM delivery skipped for ${target.tag}.`)
 				}
 
@@ -131,11 +208,20 @@ module.exports = {
 				return interaction.editReply({ embeds: [confirmationEmbed] })
 			}
 
+			/**
+			 * LIST WARNINGS FLOW
+			 *
+			 * Retrieves and formats the user's warning history.
+			 */
 			const userRecord = await GuildUser.findOne({
 				guildId,
 				userId: target.id,
 			}).lean()
 
+			/**
+			 * Validation:
+			 * If no warnings exist, return early.
+			 */
 			if (!userRecord?.warnings?.length) {
 				return interaction.editReply({
 					content: `${target.tag} does not have any warnings registered.`,

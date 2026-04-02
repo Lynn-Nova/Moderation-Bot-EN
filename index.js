@@ -1,14 +1,19 @@
 /**
  * @file index.js
- * @description Application bootstrap for the Bot.
+ * @description Entry point and bootstrap coordinator for the Discord bot.
  *
- * This module contains:
- * - environment validation before runtime bootstrap
- * - controlled async startup sequence
- * - dynamic command discovery and registration
- * - centralized interaction routing
- * - defensive error handling for Discord API workflows
- * - separation between infrastructure concerns and command execution
+ * Responsibilities:
+ * - Validate runtime environment before initialization
+ * - Initialize core infrastructure (Discord client + database)
+ * - Dynamically discover and register command modules
+ * - Synchronize application commands with Discord API
+ * - Centralize interaction routing (commands + components)
+ * - Provide defensive error handling boundaries for async workflows
+ *
+ * Architectural note:
+ * This file intentionally acts as an orchestration layer only.
+ * Business logic is delegated to command modules and data models,
+ * ensuring separation of concerns and maintainability.
  */
 
 require("dotenv").config()
@@ -28,15 +33,44 @@ const {
 } = require("discord.js")
 const GuildUser = require("./models/GuildUser")
 
+/**
+ * List of required environment variables.
+ * These represent external dependencies (credentials, URIs) that must be present
+ * for the application to function correctly.
+ */
 const REQUIRED_ENV_VARS = ["DISCORD_TOKEN", "MONGO_URI"]
+
+/**
+ * Absolute path to the commands directory.
+ * Used for runtime module discovery instead of static imports,
+ * enabling plug-and-play extensibility.
+ */
 const COMMANDS_DIRECTORY = path.join(__dirname, "commands")
+
+/**
+ * Guild-scoped command registration target.
+ * Limits slash command deployment to a specific guild for faster updates
+ * (global commands can take up to 1 hour to propagate).
+ */
 const APPLICATION_GUILD_ID = "860520561943379998"
+
+/**
+ * Custom ID used to identify the "Open Ticket" button interaction.
+ * This acts as a routing key inside the interaction dispatcher.
+ */
 const TICKET_BUTTON_ID = "open_ticket"
 
 /**
- * Fail fast if a required environment variable is missing.
- * A startup validation step is preferable to letting the application crash later during login or database connection,
- * because the error becomes deterministic and easier to debug during deployment.
+ * Validates that all required environment variables are defined.
+ *
+ * Rationale:
+ * Failing fast during startup prevents undefined behavior later
+ * (e.g., failed authentication, database connection errors).
+ *
+ * This approach improves observability and deployment reliability
+ * by surfacing configuration issues immediately.
+ *
+ * @throws {Error} If one or more required variables are missing
  */
 function validateEnvironment() {
 	const missingVariables = REQUIRED_ENV_VARS.filter(key => !process.env[key])
@@ -49,8 +83,14 @@ function validateEnvironment() {
 }
 
 /**
- * Create the Discord client once and attach a command registry.
- * Collection is used as an in-memory lookup table so command dispatching remains by command name instead of relying on nested if/else or switch blocks.
+ * Instantiates the Discord client and attaches an in-memory command registry.
+ *
+ * Design decisions:
+ * - Uses Collection for O(1) command lookup by name
+ * - Avoids conditional dispatch patterns (if/switch chains)
+ * - Attaches registry directly to client for global accessibility
+ *
+ * @returns {Client} Configured Discord client instance
  */
 function createClient() {
 	const client = new Client({
@@ -62,14 +102,31 @@ function createClient() {
 		],
 	})
 
+	/**
+	 * In-memory command registry.
+	 * Key: command name
+	 * Value: command module (data + execute handler)
+	 */
 	client.commands = new Collection()
+
 	return client
 }
 
 /**
- * Load slash command modules dynamically from disk.
- * Dynamic loading keeps the entry file small and makes the project extensible:
- * adding a new command only requires dropping a valid module into /commands.
+ * Dynamically loads command modules from the filesystem.
+ *
+ * Execution flow:
+ * 1. Read all files in /commands directory
+ * 2. Filter for valid JavaScript modules
+ * 3. Require each module
+ * 4. Validate expected interface (data + execute)
+ * 5. Register into client.commands collection
+ *
+ * Fault tolerance:
+ * Invalid modules are skipped instead of crashing the application,
+ * allowing partial functionality during development.
+ *
+ * @param {Client} client - Discord client instance
  */
 function loadCommands(client) {
 	const commandFiles = fs
@@ -91,8 +148,14 @@ function loadCommands(client) {
 }
 
 /**
- * Connect to MongoDB before the bot starts accepting interactions.
- * This ordering avoids a class of bugs where a command is executed while the persistence layer is still unavailable.
+ * Establishes a connection to MongoDB using Mongoose.
+ *
+ * Ordering guarantee:
+ * This function is awaited before the bot logs in,
+ * ensuring that any command relying on persistence
+ * does not execute against an uninitialized database.
+ *
+ * @returns {Promise<void>}
  */
 async function connectDatabase() {
 	await mongoose.connect(process.env.MONGO_URI)
@@ -100,8 +163,18 @@ async function connectDatabase() {
 }
 
 /**
- * Synchronize slash command metadata with Discord.
- * Registering commands during ready keeps the remote API aligned with the local source code and ensures newly added commands appear without manual dashboard edits.
+ * Registers (or updates) slash commands with the Discord API.
+ *
+ * Implementation details:
+ * - Uses guild-scoped registration for rapid iteration
+ * - Serializes command metadata via toJSON()
+ * - Performs a full overwrite (PUT) to ensure consistency
+ *
+ * Trade-offs:
+ * - Overwriting guarantees sync accuracy
+ * - Slightly higher API usage compared to diff-based updates
+ *
+ * @param {Client} client
  */
 async function registerSlashCommands(client) {
 	const commandsPayload = client.commands.map(command => command.data.toJSON())
@@ -120,8 +193,19 @@ async function registerSlashCommands(client) {
 }
 
 /**
- * Execute command modules behind a small safety boundary.
- * The guard handles both first responses and follow-ups because Discord only allows one initial interaction response.
+ * Executes a slash command within a controlled error boundary.
+ *
+ * Key constraints:
+ * - Discord allows only ONE initial interaction response
+ * - Subsequent responses must use followUp()
+ *
+ * Error handling strategy:
+ * - Catch all execution errors to prevent process crashes
+ * - Detect interaction state (replied/deferred)
+ * - Choose correct response method dynamically
+ *
+ * @param {ChatInputCommandInteraction} interaction
+ * @param {Client} client
  */
 async function handleChatInputCommand(interaction, client) {
 	const command = client.commands.get(interaction.commandName)
@@ -155,8 +239,22 @@ async function handleChatInputCommand(interaction, client) {
 }
 
 /**
- * Create a support ticket channel while preventing duplicates.
- * Ticket creation is intentionally centralized here because the button event is global application infrastructure, while /ticket-setup only renders the panel.
+ * Handles ticket creation triggered by a button interaction.
+ *
+ * Responsibilities:
+ * - Prevent duplicate active tickets per user
+ * - Normalize username for safe channel naming
+ * - Create a private text channel with controlled permissions
+ * - Persist ticket state in the database
+ *
+ * Data consistency:
+ * Uses an upsert operation to ensure a single record per (guildId, userId).
+ *
+ * Security considerations:
+ * - Denies @everyone visibility
+ * - Grants access only to the user and the bot
+ *
+ * @param {ButtonInteraction} interaction
  */
 async function handleTicketButton(interaction) {
 	const { guild, user } = interaction
@@ -179,6 +277,12 @@ async function handleTicketButton(interaction) {
 		}
 	}
 
+	/**
+	 * Sanitizes username to comply with Discord channel naming rules.
+	 * - Lowercase only
+	 * - Alphanumeric + hyphen
+	 * - Length capped to avoid API rejection
+	 */
 	const sanitizedUsername =
 		user.username
 			.toLowerCase()
@@ -244,8 +348,13 @@ async function handleTicketButton(interaction) {
 }
 
 /**
- * Route all interaction types through a single dispatcher.
- * Centralized routing is easier to audit because all entry points are visible in one place.
+ * Registers all runtime event listeners.
+ *
+ * Design rationale:
+ * Centralizing event binding improves traceability and debugging,
+ * as all entry points into the system are declared in one location.
+ *
+ * @param {Client} client
  */
 function registerEventHandlers(client) {
 	client.on("interactionCreate", async interaction => {
@@ -282,6 +391,19 @@ function registerEventHandlers(client) {
 	})
 }
 
+/**
+ * Main application bootstrap sequence.
+ *
+ * Execution order is critical:
+ * 1. Validate environment
+ * 2. Initialize client
+ * 3. Load commands
+ * 4. Register event handlers
+ * 5. Connect database
+ * 6. Authenticate with Discord
+ *
+ * This guarantees all dependencies are ready before handling interactions.
+ */
 async function bootstrap() {
 	validateEnvironment()
 
@@ -293,6 +415,13 @@ async function bootstrap() {
 	await client.login(process.env.DISCORD_TOKEN)
 }
 
+/**
+ * Global fatal error handler.
+ *
+ * Ensures that unrecoverable startup failures:
+ * - Are logged for debugging
+ * - Terminate the process with a non-zero exit code
+ */
 bootstrap().catch(error => {
 	console.error("Fatal startup error:", error)
 	process.exit(1)
