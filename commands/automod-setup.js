@@ -13,7 +13,9 @@
  *   └─ Sends the setup embed with a Select Menu
  *        ├─ "Banned Words"     → Modal (add/remove words)
  *        ├─ "Spam Limit"       → Modal (max messages + window seconds)
- *        ├─ "Mute Role"        → Modal (role name or ID; creates if not found)
+ *        ├─ "Mute Role"        → RoleSelectMenu (native Discord role picker)
+ *        │    └─ If no role exists yet, admin can create one via a follow-up
+ *        │       button that opens a Modal with just the role name.
  *        ├─ "Action"           → Second Select Menu (delete/warn/timeout/kick/ban)
  *        ├─ "Log Channel"      → Modal (channel ID or #mention)
  *        ├─ "Exempt Role"      → Modal (role ID or name + add/remove)
@@ -21,9 +23,12 @@
  *
  * ─── Component ID conventions ────────────────────────────────────────────────
  * All custom IDs are prefixed with "ams_" (automod setup) to avoid collisions:
- *   ams_menu          — main Select Menu
- *   ams_modal_*       — Modal submissions
- *   ams_action_select — action picker Select Menu
+ *   ams_menu              — main Select Menu
+ *   ams_modal_*           — Modal submissions
+ *   ams_action_select     — action picker Select Menu
+ *   ams_role_select       — RoleSelectMenu for mute role
+ *   ams_create_role_btn   — button to open the "create role" modal
+ *   ams_modal_create_role — modal for new role name
  *
  * ─── State management ────────────────────────────────────────────────────────
  * Config is read from and written to MongoDB (GuildConfig) on every interaction.
@@ -33,16 +38,21 @@
  * ─── Routing ─────────────────────────────────────────────────────────────────
  * The interactionCreate router in index.js must forward:
  *   - StringSelectMenu interactions with customId starting with "ams_"
+ *   - RoleSelectMenu interactions with customId "ams_role_select"
+ *   - Button interactions with customId "ams_create_role_btn"
  *   - ModalSubmit interactions with customId starting with "ams_"
  * to the handler exported by this module: `handleAutoModSetupInteraction`.
  */
 
 const {
 	ActionRowBuilder,
+	ButtonBuilder,
+	ButtonStyle,
 	EmbedBuilder,
 	MessageFlags,
 	ModalBuilder,
 	PermissionFlagsBits,
+	RoleSelectMenuBuilder,
 	SlashCommandBuilder,
 	StringSelectMenuBuilder,
 	StringSelectMenuOptionBuilder,
@@ -56,12 +66,14 @@ const autoMod = require("../events/autoMod")
 
 const MENU_ID = "ams_menu"
 const ACTION_SELECT_ID = "ams_action_select"
+const ROLE_SELECT_ID = "ams_role_select"
+const CREATE_ROLE_BTN_ID = "ams_create_role_btn"
 
 const MODAL_BANNED_WORDS = "ams_modal_banned_words"
 const MODAL_SPAM = "ams_modal_spam"
-const MODAL_MUTE_ROLE = "ams_modal_mute_role"
 const MODAL_LOG_CHANNEL = "ams_modal_log_channel"
 const MODAL_EXEMPT_ROLE = "ams_modal_exempt_role"
+const MODAL_CREATE_ROLE = "ams_modal_create_role"
 
 // ─── Slash command definition ─────────────────────────────────────────────────
 
@@ -92,6 +104,8 @@ module.exports = {
 
 	// Exported so index.js can forward component/modal interactions here
 	handleAutoModSetupInteraction,
+	ROLE_SELECT_ID,
+	CREATE_ROLE_BTN_ID,
 }
 
 // ─── Interaction router ───────────────────────────────────────────────────────
@@ -102,6 +116,8 @@ module.exports = {
  *
  * Routes by interaction type and customId:
  *   StringSelectMenu → ams_menu or ams_action_select
+ *   RoleSelectMenu   → ams_role_select
+ *   Button           → ams_create_role_btn
  *   ModalSubmit      → ams_modal_*
  *
  * @param {import('discord.js').Interaction} interaction
@@ -116,7 +132,7 @@ async function handleAutoModSetupInteraction(interaction) {
 
 			if (selected === "banned_words") return await showBannedWordsModal(interaction)
 			if (selected === "spam") return await showSpamModal(interaction)
-			if (selected === "mute_role") return await showMuteRoleModal(interaction)
+			if (selected === "mute_role") return await showMuteRoleSelect(interaction)
 			if (selected === "action") return await showActionSelect(interaction)
 			if (selected === "log_channel") return await showLogChannelModal(interaction)
 			if (selected === "exempt_role") return await showExemptRoleModal(interaction)
@@ -128,18 +144,28 @@ async function handleAutoModSetupInteraction(interaction) {
 			return await handleActionSelect(interaction, guildId)
 		}
 
+		// ── RoleSelectMenu: mute role picker ──────────────────────────────────
+		if (interaction.isRoleSelectMenu() && interaction.customId === ROLE_SELECT_ID) {
+			return await handleMuteRoleSelect(interaction, guildId)
+		}
+
+		// ── Button: open "create role" modal ──────────────────────────────────
+		if (interaction.isButton() && interaction.customId === CREATE_ROLE_BTN_ID) {
+			return await showCreateRoleModal(interaction)
+		}
+
 		// ── Modal submissions ─────────────────────────────────────────────────
 		if (interaction.isModalSubmit()) {
 			if (interaction.customId === MODAL_BANNED_WORDS)
 				return await handleBannedWordsModal(interaction, guildId)
 			if (interaction.customId === MODAL_SPAM)
 				return await handleSpamModal(interaction, guildId)
-			if (interaction.customId === MODAL_MUTE_ROLE)
-				return await handleMuteRoleModal(interaction, guildId)
 			if (interaction.customId === MODAL_LOG_CHANNEL)
 				return await handleLogChannelModal(interaction, guildId)
 			if (interaction.customId === MODAL_EXEMPT_ROLE)
 				return await handleExemptRoleModal(interaction, guildId)
+			if (interaction.customId === MODAL_CREATE_ROLE)
+				return await handleCreateRoleModal(interaction, guildId)
 		}
 	} catch (error) {
 		console.error("[AutoMod Setup] Interaction error:", error)
@@ -262,7 +288,7 @@ function buildMainMenu() {
 				.setEmoji("💬"),
 			new StringSelectMenuOptionBuilder()
 				.setLabel("Mute Role")
-				.setDescription("Set or create the mute role applied on violations")
+				.setDescription("Pick an existing role or create a new one")
 				.setValue("mute_role")
 				.setEmoji("🔇"),
 			new StringSelectMenuOptionBuilder()
@@ -323,6 +349,34 @@ function buildActionSelectMenu() {
 		)
 
 	return new ActionRowBuilder().addComponents(menu)
+}
+
+/**
+ * Builds the RoleSelectMenu row for picking an existing role as mute role.
+ *
+ * @returns {ActionRowBuilder}
+ */
+function buildMuteRoleSelectMenu() {
+	const roleSelect = new RoleSelectMenuBuilder()
+		.setCustomId(ROLE_SELECT_ID)
+		.setPlaceholder("🔇 Select the mute role...")
+
+	return new ActionRowBuilder().addComponents(roleSelect)
+}
+
+/**
+ * Builds the "Create new role" button row shown alongside the RoleSelectMenu.
+ * Gives the admin an alternative if the mute role doesn't exist yet.
+ *
+ * @returns {ActionRowBuilder}
+ */
+function buildCreateRoleButton() {
+	return new ActionRowBuilder().addComponents(
+		new ButtonBuilder()
+			.setCustomId(CREATE_ROLE_BTN_ID)
+			.setLabel("➕ Create New Mute Role")
+			.setStyle(ButtonStyle.Secondary),
+	)
 }
 
 // ─── Modal openers ────────────────────────────────────────────────────────────
@@ -397,27 +451,22 @@ async function showSpamModal(interaction) {
 }
 
 /**
- * Shows the mute role configuration modal.
+ * Shows a RoleSelectMenu so the admin can pick an existing role as mute role,
+ * plus a "Create New Mute Role" button for when no suitable role exists yet.
  *
- * The admin can provide either:
- *   - An existing role name or ID  → bot resolves and saves it
- *   - A new role name              → bot creates the role with send-message denied
+ * Why two components?
+ *   Discord's RoleSelectMenu only shows existing roles. If the server doesn't
+ *   have a mute role yet, the admin needs another path. The button opens a
+ *   small modal that only asks for the new role's name — the bot handles
+ *   creation and channel overrides automatically.
  */
-async function showMuteRoleModal(interaction) {
-	const modal = new ModalBuilder()
-		.setCustomId(MODAL_MUTE_ROLE)
-		.setTitle("Configure Mute Role")
-
-	const roleInput = new TextInputBuilder()
-		.setCustomId("role_name_or_id")
-		.setLabel("Role name or ID (creates if not found)")
-		.setStyle(TextInputStyle.Short)
-		.setPlaceholder("Muted  or  123456789012345678")
-		.setRequired(true)
-
-	modal.addComponents(new ActionRowBuilder().addComponents(roleInput))
-
-	await interaction.showModal(modal)
+async function showMuteRoleSelect(interaction) {
+	await interaction.reply({
+		content:
+			"Pick an existing role to use as the mute role, or create a new one:",
+		components: [buildMuteRoleSelectMenu(), buildCreateRoleButton()],
+		flags: MessageFlags.Ephemeral,
+	})
 }
 
 /** Shows the log channel configuration modal. */
@@ -466,6 +515,29 @@ async function showExemptRoleModal(interaction) {
 	await interaction.showModal(modal)
 }
 
+/**
+ * Shows a small modal that asks only for the new role's name.
+ * The bot handles role creation and channel overrides automatically
+ * when the modal is submitted.
+ */
+async function showCreateRoleModal(interaction) {
+	const modal = new ModalBuilder()
+		.setCustomId(MODAL_CREATE_ROLE)
+		.setTitle("Create Mute Role")
+
+	const roleNameInput = new TextInputBuilder()
+		.setCustomId("role_name")
+		.setLabel("New role name")
+		.setStyle(TextInputStyle.Short)
+		.setPlaceholder("Muted")
+		.setMaxLength(100)
+		.setRequired(true)
+
+	modal.addComponents(new ActionRowBuilder().addComponents(roleNameInput))
+
+	await interaction.showModal(modal)
+}
+
 /** Shows the action picker as a second Select Menu (inline, no modal needed). */
 async function showActionSelect(interaction) {
 	await interaction.reply({
@@ -509,6 +581,80 @@ async function handleActionSelect(interaction, guildId) {
 	await interaction.update({
 		content: `✅ Action set to **${action.toUpperCase()}**.`,
 		components: [],
+	})
+}
+
+/**
+ * Handles the RoleSelectMenu submission for mute role.
+ *
+ * The selected role is saved directly to config — no creation needed.
+ * interaction.roles is a Collection of the selected roles; we take the first.
+ */
+async function handleMuteRoleSelect(interaction, guildId) {
+	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+
+	const role = interaction.roles.first()
+
+	if (!role) {
+		return interaction.editReply({ content: "❌ No role selected." })
+	}
+
+	const config = await GuildConfig.getOrCreate(guildId)
+	config.autoMod.muteRoleId = role.id
+	await config.save()
+	autoMod.invalidateCache(guildId)
+
+	await interaction.editReply({
+		content: `✅ Mute role set to ${role} (\`${role.name}\`).`,
+	})
+}
+
+/**
+ * Handles the "create role" modal submission.
+ *
+ * Creates a new role with the given name, applies channel permission
+ * overrides in all text channels to deny sending messages, then saves
+ * the new role's ID to config.
+ *
+ * Why apply overrides on creation?
+ * Discord roles with denied permissions must have explicit channel-level
+ * overrides to take effect. Iterating all text channels on creation is a
+ * one-time cost that ensures the role works immediately in all channels.
+ */
+async function handleCreateRoleModal(interaction, guildId) {
+	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+
+	const roleName = interaction.fields.getTextInputValue("role_name").trim()
+	const { guild } = interaction
+
+	const muteRole = await guild.roles.create({
+		name: roleName,
+		color: 0x2b2d31,
+		reason: "AutoMod mute role — created automatically by setup panel",
+	})
+
+	// Apply channel overrides in all text-based channels
+	const { PermissionFlagsBits } = require("discord.js")
+	const textChannels = guild.channels.cache.filter(c => c.isTextBased())
+
+	for (const [, channel] of textChannels) {
+		await channel.permissionOverwrites
+			.create(muteRole, {
+				SendMessages: false,
+				AddReactions: false,
+				CreatePublicThreads: false,
+				CreatePrivateThreads: false,
+			})
+			.catch(() => null) // Non-fatal — some channels may lack permission
+	}
+
+	const config = await GuildConfig.getOrCreate(guildId)
+	config.autoMod.muteRoleId = muteRole.id
+	await config.save()
+	autoMod.invalidateCache(guildId)
+
+	await interaction.editReply({
+		content: `✅ Created and saved mute role: ${muteRole} (\`${muteRole.name}\`). Channel overrides applied.`,
 	})
 }
 
@@ -609,83 +755,6 @@ async function handleSpamModal(interaction, guildId) {
 			: `✅ Spam limit set to **${maxMessages} messages** per **${windowSeconds}s**.`
 
 	await interaction.editReply({ content: msg })
-}
-
-/**
- * Processes the mute role modal submission.
- *
- * Resolution order:
- *   1. Try to find an existing role by ID (exact match).
- *   2. Try to find an existing role by name (case-insensitive).
- *   3. If not found → create a new role with the given name.
- *
- * When creating:
- *   - Sets color to 0x2b2d31 (dark grey, unobtrusive)
- *   - Applies a channel permission override in all text channels
- *     denying SendMessages, AddReactions, and CreatePublicThreads.
- *
- * Why apply overrides on creation?
- * Discord roles with denied permissions must have explicit channel-level
- * overrides to take effect. Iterating all text channels on creation is a
- * one-time cost that ensures the role works immediately in all channels.
- */
-async function handleMuteRoleModal(interaction, guildId) {
-	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
-
-	const input = interaction.fields.getTextInputValue("role_name_or_id").trim()
-	const { guild } = interaction
-
-	// Fetch full role list (ensures cache is populated)
-	await guild.roles.fetch()
-
-	// Step 1: try by ID
-	let muteRole = guild.roles.cache.get(input)
-
-	// Step 2: try by name (case-insensitive)
-	if (!muteRole) {
-		muteRole = guild.roles.cache.find(
-			r => r.name.toLowerCase() === input.toLowerCase(),
-		)
-	}
-
-	let created = false
-
-	// Step 3: create if not found
-	if (!muteRole) {
-		muteRole = await guild.roles.create({
-			name: input,
-			color: 0x2b2d31,
-			reason: "AutoMod mute role — created automatically by setup panel",
-		})
-
-		// Apply channel overrides in all text-based channels
-		const { PermissionFlagsBits } = require("discord.js")
-		const textChannels = guild.channels.cache.filter(c => c.isTextBased())
-
-		for (const [, channel] of textChannels) {
-			await channel.permissionOverwrites
-				.create(muteRole, {
-					SendMessages: false,
-					AddReactions: false,
-					CreatePublicThreads: false,
-					CreatePrivateThreads: false,
-				})
-				.catch(() => null) // Non-fatal — some channels may lack permission
-		}
-
-		created = true
-	}
-
-	// Save to config
-	const config = await GuildConfig.getOrCreate(guildId)
-	config.autoMod.muteRoleId = muteRole.id
-	await config.save()
-	autoMod.invalidateCache(guildId)
-
-	const verb = created ? "Created and saved" : "Found and saved"
-	await interaction.editReply({
-		content: `✅ ${verb} mute role: ${muteRole} (\`${muteRole.name}\`)`,
-	})
 }
 
 /** Processes the log channel modal submission. */
