@@ -425,22 +425,13 @@ function registerEventHandlers(client) {
 
 	client.on("interactionCreate", async interaction => {
 		try {
-			// Route AutoMod setup interactions (Select Menus + Modals prefixed with ams_)
-			if (
-				(interaction.isStringSelectMenu() || interaction.isModalSubmit()) &&
-				interaction.customId?.startsWith("ams_")
-			) {
+			// Route AutoMod setup interactions (Buttons + Select Menus + Modals prefixed with ams_)
+			if (interaction.customId?.startsWith("ams_")) {
 				return await handleAutoModSetupInteraction(interaction)
 			}
 
 			// Route Ticket setup interactions (Select Menus + Channel Select + Modals + Publish button)
-			if (
-				(interaction.isStringSelectMenu() ||
-					interaction.isChannelSelectMenu() ||
-					interaction.isModalSubmit() ||
-					(interaction.isButton() && interaction.customId === PUBLISH_BTN_ID)) &&
-				interaction.customId?.startsWith("tks_")
-			) {
+			if (interaction.customId?.startsWith("tks_")) {
 				return await handleTicketSetupInteraction(interaction)
 			}
 

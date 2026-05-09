@@ -349,29 +349,30 @@ async function showChannelSelect(interaction) {
 // ─── Interaction handlers ─────────────────────────────────────────────────────
 
 /**
- * Saves the panel appearance settings to MongoDB and updates the setup panel
- * in-place so the admin sees the new preview immediately.
+ * Saves the panel appearance settings to MongoDB, then replies with the full
+ * updated setup panel (status embed + preview embed + menu + publish button).
  *
- * Key fix: after saving, calls interaction.message.edit() to update the
- * original ephemeral setup message (embeds + components) instead of sending
- * a separate editReply — this ensures the preview the admin sees is always
- * the current saved state, not stale data from when /ticket-setup was run.
+ * WHY deferReply instead of deferUpdate:
+ *   Modal submit interactions do NOT carry a reference to the original message.
+ *   interaction.message is undefined in modal submits opened from a select menu.
+ *   deferUpdate() would produce a silent ack with no visible feedback at all.
+ *   deferReply (ephemeral) + editReply sends a new ephemeral message showing
+ *   the admin the fully up-to-date panel after each save.
  *
- * Uses spread over toObject() to avoid mutating a Mongoose subdocument
- * directly, which can cause Mongoose to miss the change for markModified.
+ * WHY spread over toObject():
+ *   Ensures unrelated fields (buttonLabel, logChannelId, etc.) are preserved
+ *   and not wiped out when saving only the appearance fields.
  */
 async function handlePanelModal(interaction, guildId) {
-	await interaction.deferUpdate()
+	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
 
 	const title = interaction.fields.getTextInputValue("title").trim()
 	const description = interaction.fields.getTextInputValue("description").trim()
 	const color = interaction.fields.getTextInputValue("color").trim()
 
 	if (!/^#[0-9A-Fa-f]{3,6}$/.test(color)) {
-		// Can't show a modal error after deferUpdate; send a followUp instead
-		return interaction.followUp({
+		return interaction.editReply({
 			content: "❌ Invalid color. Use a hex code like `#5865F2`.",
-			flags: MessageFlags.Ephemeral,
 		})
 	}
 
@@ -382,27 +383,25 @@ async function handlePanelModal(interaction, guildId) {
 	config.markModified("ticketPanel")
 	await config.save()
 
-	// Re-read saved data to guarantee the preview reflects exactly what's in DB
+	// Re-read from the saved document — guarantees preview shows what's in DB
 	const saved = config.ticketPanel?.toObject?.() ?? config.ticketPanel ?? {}
 
-	// Edit the original setup panel message in-place — the admin sees the
-	// updated preview without any new message appearing in the channel.
 	await interaction.editReply({
-		content: "**Ticket Panel Setup** — Customize below, then publish.",
+		content: "✅ Appearance saved. Here is your updated panel:",
 		embeds: [buildConfigStatusEmbed(saved), buildPreviewEmbed(saved)],
 		components: [buildSetupMenu(), buildPublishButton()],
 	})
 }
 
 /**
- * Saves button label and emoji to MongoDB and updates the setup panel
- * in-place so the config status embed reflects the new button immediately.
+ * Saves button label and emoji to MongoDB, then replies with the full
+ * updated setup panel so the admin sees the current state immediately.
  *
- * Same pattern as handlePanelModal: deferUpdate → save → editReply to
- * refresh the original ephemeral message rather than creating a new one.
+ * Same pattern as handlePanelModal — see that function's comment for the
+ * explanation of why deferReply is used instead of deferUpdate.
  */
 async function handleButtonModal(interaction, guildId) {
-	await interaction.deferUpdate()
+	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
 
 	const label = interaction.fields.getTextInputValue("label").trim()
 	const emoji = interaction.fields.getTextInputValue("emoji").trim()
@@ -421,17 +420,18 @@ async function handleButtonModal(interaction, guildId) {
 	const saved = config.ticketPanel?.toObject?.() ?? config.ticketPanel ?? {}
 
 	await interaction.editReply({
-		content: "**Ticket Panel Setup** — Customize below, then publish.",
+		content: "✅ Button saved. Here is your updated panel:",
 		embeds: [buildConfigStatusEmbed(saved), buildPreviewEmbed(saved)],
 		components: [buildSetupMenu(), buildPublishButton()],
 	})
 }
 
 /**
- * Handles the ChannelSelectMenu submission.
+ * Handles the ChannelSelectMenu submission for log channel.
  *
- * interaction.channels is a Collection of the selected channels.
- * We take the first (only one is selected here) and save its ID.
+ * ChannelSelectMenu interactions DO carry interaction.message, but for
+ * consistency with the modal handlers we reply with the full updated panel
+ * so the admin always gets a single coherent view of the current state.
  */
 async function handleChannelSelect(interaction, guildId) {
 	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
@@ -449,8 +449,12 @@ async function handleChannelSelect(interaction, guildId) {
 	config.markModified("ticketPanel")
 	await config.save()
 
+	const saved = config.ticketPanel?.toObject?.() ?? config.ticketPanel ?? {}
+
 	await interaction.editReply({
-		content: `✅ Ticket transcripts will be saved to ${channel}.`,
+		content: `✅ Log channel saved to ${channel}. Here is your updated panel:`,
+		embeds: [buildConfigStatusEmbed(saved), buildPreviewEmbed(saved)],
+		components: [buildSetupMenu(), buildPublishButton()],
 	})
 }
 

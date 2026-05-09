@@ -84,7 +84,7 @@ const autoModConfigSchema = new mongoose.Schema(
 
 		/**
 		 * AutoMod action applied when a violation is detected.
-		 * Supported values: "delete", "warn", "timeout", "kick", "ban"
+		 * Supported values: "delete", "warn", "mute", "timeout", "kick", "ban"
 		 *
 		 * "delete" — removes the offending message only (no user punishment).
 		 * "warn"   — deletes + adds a warning entry to GuildUser.
@@ -94,7 +94,7 @@ const autoModConfigSchema = new mongoose.Schema(
 		 */
 		action: {
 			type: String,
-			enum: ["delete", "warn", "timeout", "kick", "ban"],
+			enum: ["delete", "warn", "mute", "timeout", "kick", "ban"],
 			default: "warn",
 		},
 
@@ -188,15 +188,12 @@ const guildConfigSchema = new mongoose.Schema(
 			type: autoModConfigSchema,
 			default: () => ({}), // Factory default — ensures subdocument defaults apply
 		},
-	},
-	{
-		/**
-		 * Ticket panel customization settings.
-		 */
 		ticketPanel: {
 			type: ticketPanelSchema,
 			default: () => ({}),
 		},
+	},
+	{
 		timestamps: true, // createdAt / updatedAt for auditing config changes
 	},
 )
