@@ -59,7 +59,7 @@ commands/
   mod.js              — Kick / ban / timeout with DB logging
   warnings.js         — Warn add + paginated warn list
   warn-remove.js      — Remove a specific warning by index
-  ticket.js           — Ticket panel setup
+  ticket-setup.js           — Ticket panel setup
   close.js            — Ticket closure with DB cleanup
   automod.js          — AutoMod configuration command
 events/
