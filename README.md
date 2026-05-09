@@ -10,7 +10,7 @@ Designed with clear architectural separation, persistent moderation logs, and an
 ### Slash Commands
 
 | Command | Description |
-| --- | --- |
+|---|---|
 | `/mod kick` | Kick a member (logs to DB) |
 | `/mod ban` | Ban a member (logs to DB) |
 | `/mod timeout` | Timeout a member for N minutes |
@@ -53,13 +53,13 @@ Autonomous message moderation powered by an event-driven `messageCreate` listene
 
 ## Architecture
 
-```text
+```
 index.js              — Bootstrap, client creation, interaction router
 commands/
   mod.js              — Kick / ban / timeout with DB logging
   warnings.js         — Warn add + paginated warn list
   warn-remove.js      — Remove a specific warning by index
-  ticket-setup.js           — Ticket panel setup
+  ticket.js           — Ticket panel setup
   close.js            — Ticket closure with DB cleanup
   automod.js          — AutoMod configuration command
 events/
@@ -85,6 +85,6 @@ models/
 ## Environment Variables
 
 | Variable | Description |
-| --- | --- |
+|---|---|
 | `DISCORD_TOKEN` | Bot token from the Discord Developer Portal |
 | `MONGO_URI` | MongoDB connection string |

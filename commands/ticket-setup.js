@@ -3,43 +3,37 @@
  * @description Interactive ticket panel setup with full customization support.
  *
  * ─── Overview ────────────────────────────────────────────────────────────────
- * Replaces the static /ticket-setup command with a two-step configuration flow:
+ * Two-step configuration flow:
  *
  *   Step 1 — /ticket-setup
- *     Sends an ephemeral configuration panel to the admin with a Select Menu
- *     for choosing which aspect to customize:
- *       • Panel message (title, description, emoji, color)
- *       • Button label and emoji
- *       • Log channel for ticket transcripts
+ *     Sends an ephemeral panel to the admin with a Select Menu:
+ *       • Panel Appearance  → Modal (title, description, color)
+ *       • Button            → Modal (label, emoji)
+ *       • Log Channel       → ChannelSelectMenu (choose from server channels)
  *
- *   Step 2 — Admin confirms via "Publish Panel" button
- *     The bot posts the fully customized embed + ticket button to the channel.
+ *   Step 2 — Admin clicks "✅ Publish Panel"
+ *     Posts the customized embed + ticket button publicly to the channel.
  *
- * ─── Customization options ────────────────────────────────────────────────────
- *   Title         — embed title (supports emojis)
- *   Description   — embed description (multi-line, supports emojis)
- *   Color         — hex color code (e.g. #5865F2)
- *   Button label  — text on the open-ticket button (supports emojis)
- *   Log channel   — channel ID where ticket transcripts are saved on /close
- *
- * ─── Persistence ─────────────────────────────────────────────────────────────
- * Customization is stored in GuildConfig.ticketPanel (new subdocument).
- * The /close command reads ticketPanel.logChannelId to know where to post
- * the transcript after collecting the channel's message history.
+ * ─── Bug fixes vs previous version ──────────────────────────────────────────
+ * - handlePublish now reads config fresh from DB (not stale local reference)
+ *   and calls .toObject() on the Mongoose subdocument before reading fields,
+ *   preventing undefined values when ticketPanel was saved but not hydrated.
+ * - Log channel selection replaced with ChannelSelectMenu (no ID typing needed).
  *
  * ─── Component ID conventions ────────────────────────────────────────────────
- * All IDs are prefixed with "tks_" (ticket setup):
  *   tks_menu              — setup Select Menu
  *   tks_modal_panel       — panel appearance modal
- *   tks_modal_button      — button label modal
- *   tks_modal_log         — log channel modal
- *   tks_publish           — publish confirmation button
+ *   tks_modal_button      — button label/emoji modal
+ *   tks_channel_select    — channel picker (ChannelSelectMenu)
+ *   tks_publish           — publish button
  */
 
 const {
 	ActionRowBuilder,
 	ButtonBuilder,
 	ButtonStyle,
+	ChannelSelectMenuBuilder,
+	ChannelType,
 	EmbedBuilder,
 	MessageFlags,
 	ModalBuilder,
@@ -57,20 +51,21 @@ const GuildConfig = require("../models/GuildConfig")
 const MENU_ID = "tks_menu"
 const MODAL_PANEL = "tks_modal_panel"
 const MODAL_BUTTON = "tks_modal_button"
-const MODAL_LOG = "tks_modal_log"
+const CHANNEL_SELECT_ID = "tks_channel_select"
 const PUBLISH_BTN_ID = "tks_publish"
 
-/** Default ticket panel appearance used before any customization. */
+/** Default ticket panel appearance (used for fields not yet customized). */
 const DEFAULTS = {
 	title: "🎫 Support Ticket System",
 	description:
 		"Need help from the moderation team?\n\nClick the button below to create a private support channel.\nOnly you and the moderation team will be able to see it.",
-	color: 0x5865f2, // Discord blurple
+	color: 0x5865f2,
+	colorHex: "#5865F2",
 	buttonLabel: "Open Ticket",
 	buttonEmoji: "📩",
 }
 
-// ─── Slash command ────────────────────────────────────────────────────────────
+// ─── Module export ────────────────────────────────────────────────────────────
 
 module.exports = {
 	data: new SlashCommandBuilder()
@@ -79,38 +74,34 @@ module.exports = {
 		.setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
 	/**
-	 * Sends the configuration panel to the admin (ephemeral).
-	 * Shows a preview of the current config and the setup Select Menu.
+	 * Sends the setup panel to the admin (ephemeral).
 	 *
 	 * @param {import('discord.js').ChatInputCommandInteraction} interaction
 	 */
 	async execute(interaction) {
 		const config = await GuildConfig.getOrCreate(interaction.guild.id)
-		const panel = config.ticketPanel ?? {}
 
-		const previewEmbed = buildPreviewEmbed(panel)
-		const configEmbed = buildConfigStatusEmbed(panel)
-		const row = buildSetupMenu()
-		const publishRow = buildPublishButton()
+		// .toObject() converts the Mongoose subdocument to a plain JS object,
+		// ensuring field access works correctly even on freshly-loaded documents.
+		const panel = config.ticketPanel?.toObject?.() ?? config.ticketPanel ?? {}
 
 		await interaction.reply({
-			content: "**Ticket Panel Setup** — Customize the panel below, then publish it.",
-			embeds: [configEmbed, previewEmbed],
-			components: [row, publishRow],
+			content: "**Ticket Panel Setup** — Customize below, then publish.",
+			embeds: [buildConfigStatusEmbed(panel), buildPreviewEmbed(panel)],
+			components: [buildSetupMenu(), buildPublishButton()],
 			flags: MessageFlags.Ephemeral,
 		})
 	},
 
-	// Exported for index.js routing
 	handleTicketSetupInteraction,
 	PUBLISH_BTN_ID,
+	CHANNEL_SELECT_ID,
 }
 
 // ─── Interaction router ───────────────────────────────────────────────────────
 
 /**
- * Handles all tks_* component and modal interactions.
- * Called from index.js whenever customId starts with "tks_".
+ * Routes all tks_* interactions from index.js.
  *
  * @param {import('discord.js').Interaction} interaction
  */
@@ -118,29 +109,39 @@ async function handleTicketSetupInteraction(interaction) {
 	const guildId = interaction.guild.id
 
 	try {
+		// Main setup Select Menu
 		if (interaction.isStringSelectMenu() && interaction.customId === MENU_ID) {
 			const selected = interaction.values[0]
-			if (selected === "panel") return await showPanelModal(interaction)
-			if (selected === "button") return await showButtonModal(interaction)
-			if (selected === "log") return await showLogModal(interaction)
+			if (selected === "panel") return await showPanelModal(interaction, guildId)
+			if (selected === "button") return await showButtonModal(interaction, guildId)
+			if (selected === "log") return await showChannelSelect(interaction)
 		}
 
+		// Channel picker for log channel
+		if (interaction.isChannelSelectMenu() && interaction.customId === CHANNEL_SELECT_ID) {
+			return await handleChannelSelect(interaction, guildId)
+		}
+
+		// Modal submissions
 		if (interaction.isModalSubmit()) {
 			if (interaction.customId === MODAL_PANEL)
 				return await handlePanelModal(interaction, guildId)
 			if (interaction.customId === MODAL_BUTTON)
 				return await handleButtonModal(interaction, guildId)
-			if (interaction.customId === MODAL_LOG)
-				return await handleLogModal(interaction, guildId)
 		}
 
+		// Publish button
 		if (interaction.isButton() && interaction.customId === PUBLISH_BTN_ID) {
 			return await handlePublish(interaction, guildId)
 		}
 	} catch (error) {
 		console.error("[Ticket Setup] Interaction error:", error)
-		const payload = { content: "An error occurred. Please try again.", flags: MessageFlags.Ephemeral }
-		if (interaction.replied || interaction.deferred) return interaction.followUp(payload).catch(() => null)
+		const payload = {
+			content: "An error occurred. Please try again.",
+			flags: MessageFlags.Ephemeral,
+		}
+		if (interaction.replied || interaction.deferred)
+			return interaction.followUp(payload).catch(() => null)
 		return interaction.reply(payload).catch(() => null)
 	}
 }
@@ -148,24 +149,25 @@ async function handleTicketSetupInteraction(interaction) {
 // ─── UI builders ──────────────────────────────────────────────────────────────
 
 /**
- * Builds a live preview of how the published panel will look.
- * Uses current config values (or defaults) so the admin sees the real result.
+ * Builds the live preview embed — exactly how the published panel will look.
+ * Always reads from the `panel` plain object (after toObject()) so values
+ * are never undefined due to Mongoose subdocument quirks.
  *
- * @param {object} panel  ticketPanel config subdocument
+ * @param {object} panel
  * @returns {EmbedBuilder}
  */
 function buildPreviewEmbed(panel) {
 	const color = hexToInt(panel.color) ?? DEFAULTS.color
 
 	return new EmbedBuilder()
-		.setTitle(panel.title ?? DEFAULTS.title)
-		.setDescription(panel.description ?? DEFAULTS.description)
+		.setTitle(panel.title || DEFAULTS.title)
+		.setDescription(panel.description || DEFAULTS.description)
 		.setColor(color)
-		.setFooter({ text: "👆 This is a preview of the published panel" })
+		.setFooter({ text: "👆 Preview — this is how the published panel will look" })
 }
 
 /**
- * Builds the config status embed showing current settings.
+ * Builds the config status embed showing current saved settings.
  *
  * @param {object} panel
  * @returns {EmbedBuilder}
@@ -177,17 +179,17 @@ function buildConfigStatusEmbed(panel) {
 		.addFields(
 			{
 				name: "Title",
-				value: panel.title ?? DEFAULTS.title,
+				value: panel.title || DEFAULTS.title,
 				inline: true,
 			},
 			{
 				name: "Color",
-				value: panel.color ?? "#5865F2",
+				value: panel.color || DEFAULTS.colorHex,
 				inline: true,
 			},
 			{
-				name: "Button Label",
-				value: `${panel.buttonEmoji ?? DEFAULTS.buttonEmoji} ${panel.buttonLabel ?? DEFAULTS.buttonLabel}`,
+				name: "Button",
+				value: `${panel.buttonEmoji || DEFAULTS.buttonEmoji} ${panel.buttonLabel || DEFAULTS.buttonLabel}`,
 				inline: true,
 			},
 			{
@@ -198,11 +200,11 @@ function buildConfigStatusEmbed(panel) {
 		)
 }
 
-/** Builds the setup Select Menu. */
+/** Builds the main setup Select Menu. */
 function buildSetupMenu() {
 	const menu = new StringSelectMenuBuilder()
 		.setCustomId(MENU_ID)
-		.setPlaceholder("🎨 Customize the ticket panel...")
+		.setPlaceholder("🎨 Choose a setting to customize...")
 		.addOptions(
 			new StringSelectMenuOptionBuilder()
 				.setLabel("Panel Appearance")
@@ -216,7 +218,7 @@ function buildSetupMenu() {
 				.setEmoji("🔘"),
 			new StringSelectMenuOptionBuilder()
 				.setLabel("Log Channel")
-				.setDescription("Set the channel for ticket transcripts")
+				.setDescription("Choose the channel where transcripts are saved")
 				.setValue("log")
 				.setEmoji("📋"),
 		)
@@ -224,7 +226,7 @@ function buildSetupMenu() {
 	return new ActionRowBuilder().addComponents(menu)
 }
 
-/** Builds the publish confirmation button. */
+/** Builds the publish button row. */
 function buildPublishButton() {
 	return new ActionRowBuilder().addComponents(
 		new ButtonBuilder()
@@ -236,10 +238,14 @@ function buildPublishButton() {
 
 // ─── Modal openers ────────────────────────────────────────────────────────────
 
-/** Shows the panel appearance modal (title, description, color). */
-async function showPanelModal(interaction) {
-	const config = await GuildConfig.getOrCreate(interaction.guild.id)
-	const panel = config.ticketPanel ?? {}
+/**
+ * Shows the panel appearance modal pre-filled with current saved values.
+ * Pre-filling with current values lets the admin edit in-place rather than
+ * re-typing everything from scratch on each change.
+ */
+async function showPanelModal(interaction, guildId) {
+	const config = await GuildConfig.getOrCreate(guildId)
+	const panel = config.ticketPanel?.toObject?.() ?? config.ticketPanel ?? {}
 
 	const modal = new ModalBuilder()
 		.setCustomId(MODAL_PANEL)
@@ -249,27 +255,27 @@ async function showPanelModal(interaction) {
 		new ActionRowBuilder().addComponents(
 			new TextInputBuilder()
 				.setCustomId("title")
-				.setLabel("Panel title (emojis supported)")
+				.setLabel("Title (emojis supported)")
 				.setStyle(TextInputStyle.Short)
-				.setValue(panel.title ?? DEFAULTS.title)
+				.setValue(panel.title || DEFAULTS.title)
 				.setMaxLength(256)
 				.setRequired(true),
 		),
 		new ActionRowBuilder().addComponents(
 			new TextInputBuilder()
 				.setCustomId("description")
-				.setLabel("Panel description (emojis supported)")
+				.setLabel("Description (emojis supported)")
 				.setStyle(TextInputStyle.Paragraph)
-				.setValue(panel.description ?? DEFAULTS.description)
+				.setValue(panel.description || DEFAULTS.description)
 				.setMaxLength(2048)
 				.setRequired(true),
 		),
 		new ActionRowBuilder().addComponents(
 			new TextInputBuilder()
 				.setCustomId("color")
-				.setLabel("Color (hex code, e.g. #5865F2)")
+				.setLabel("Color (hex, e.g. #5865F2)")
 				.setStyle(TextInputStyle.Short)
-				.setValue(panel.color ?? "#5865F2")
+				.setValue(panel.color || DEFAULTS.colorHex)
 				.setMinLength(4)
 				.setMaxLength(7)
 				.setRequired(true),
@@ -279,14 +285,16 @@ async function showPanelModal(interaction) {
 	await interaction.showModal(modal)
 }
 
-/** Shows the button customization modal (label, emoji). */
-async function showButtonModal(interaction) {
-	const config = await GuildConfig.getOrCreate(interaction.guild.id)
-	const panel = config.ticketPanel ?? {}
+/**
+ * Shows the button customization modal pre-filled with current saved values.
+ */
+async function showButtonModal(interaction, guildId) {
+	const config = await GuildConfig.getOrCreate(guildId)
+	const panel = config.ticketPanel?.toObject?.() ?? config.ticketPanel ?? {}
 
 	const modal = new ModalBuilder()
 		.setCustomId(MODAL_BUTTON)
-		.setTitle("Customize Open Ticket Button")
+		.setTitle("Customize Ticket Button")
 
 	modal.addComponents(
 		new ActionRowBuilder().addComponents(
@@ -294,16 +302,16 @@ async function showButtonModal(interaction) {
 				.setCustomId("label")
 				.setLabel("Button label")
 				.setStyle(TextInputStyle.Short)
-				.setValue(panel.buttonLabel ?? DEFAULTS.buttonLabel)
+				.setValue(panel.buttonLabel || DEFAULTS.buttonLabel)
 				.setMaxLength(80)
 				.setRequired(true),
 		),
 		new ActionRowBuilder().addComponents(
 			new TextInputBuilder()
 				.setCustomId("emoji")
-				.setLabel("Button emoji (Unicode or Discord emoji)")
+				.setLabel("Button emoji")
 				.setStyle(TextInputStyle.Short)
-				.setValue(panel.buttonEmoji ?? DEFAULTS.buttonEmoji)
+				.setValue(panel.buttonEmoji || DEFAULTS.buttonEmoji)
 				.setMaxLength(50)
 				.setRequired(false),
 		),
@@ -312,29 +320,37 @@ async function showButtonModal(interaction) {
 	await interaction.showModal(modal)
 }
 
-/** Shows the log channel modal. */
-async function showLogModal(interaction) {
-	const modal = new ModalBuilder()
-		.setCustomId(MODAL_LOG)
-		.setTitle("Ticket Log Channel")
+/**
+ * Shows a ChannelSelectMenu for picking the log channel.
+ *
+ * ChannelSelectMenu renders Discord's native channel picker UI —
+ * the admin clicks and selects from their actual server channels,
+ * no ID typing required. Filtered to text-based channels only.
+ */
+async function showChannelSelect(interaction) {
+	const channelSelect = new ChannelSelectMenuBuilder()
+		.setCustomId(CHANNEL_SELECT_ID)
+		.setPlaceholder("📋 Select the log channel for ticket transcripts...")
+		.setChannelTypes(
+			ChannelType.GuildText,
+			ChannelType.GuildAnnouncement,
+		)
 
-	modal.addComponents(
-		new ActionRowBuilder().addComponents(
-			new TextInputBuilder()
-				.setCustomId("channel_id")
-				.setLabel("Channel ID for ticket transcripts")
-				.setStyle(TextInputStyle.Short)
-				.setPlaceholder("123456789012345678")
-				.setRequired(true),
-		),
-	)
-
-	await interaction.showModal(modal)
+	await interaction.reply({
+		content: "Choose the channel where ticket transcripts will be saved when a ticket is closed:",
+		components: [new ActionRowBuilder().addComponents(channelSelect)],
+		flags: MessageFlags.Ephemeral,
+	})
 }
 
-// ─── Modal handlers ───────────────────────────────────────────────────────────
+// ─── Interaction handlers ─────────────────────────────────────────────────────
 
-/** Saves panel appearance settings and refreshes the preview. */
+/**
+ * Saves the panel appearance settings to MongoDB.
+ *
+ * Uses spread over toObject() to avoid mutating a Mongoose subdocument
+ * directly, which can cause Mongoose to miss the change for markModified.
+ */
 async function handlePanelModal(interaction, guildId) {
 	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
 
@@ -342,36 +358,29 @@ async function handlePanelModal(interaction, guildId) {
 	const description = interaction.fields.getTextInputValue("description").trim()
 	const color = interaction.fields.getTextInputValue("color").trim()
 
-	// Validate hex color
 	if (!/^#[0-9A-Fa-f]{3,6}$/.test(color)) {
 		return interaction.editReply({
-			content: "❌ Invalid color format. Use a hex code like `#5865F2`.",
+			content: "❌ Invalid color. Use a hex code like `#5865F2`.",
 		})
 	}
 
 	const config = await GuildConfig.getOrCreate(guildId)
+	const existing = config.ticketPanel?.toObject?.() ?? {}
 
-	// MongoDB does not support dot-notation assignment on nested paths
-	// in all Mongoose versions — always reassign the full subdocument
-	config.ticketPanel = {
-		...(config.ticketPanel ?? {}),
-		title,
-		description,
-		color,
-	}
+	config.ticketPanel = { ...existing, title, description, color }
 	config.markModified("ticketPanel")
 	await config.save()
 
-	const previewEmbed = buildPreviewEmbed(config.ticketPanel)
-	const configEmbed = buildConfigStatusEmbed(config.ticketPanel)
+	// Re-read from DB to ensure preview reflects what was actually saved
+	const saved = config.ticketPanel?.toObject?.() ?? config.ticketPanel ?? {}
 
 	await interaction.editReply({
-		content: "✅ Panel appearance updated. Preview refreshed.",
-		embeds: [configEmbed, previewEmbed],
+		content: "✅ Appearance updated. Here is the updated preview:",
+		embeds: [buildConfigStatusEmbed(saved), buildPreviewEmbed(saved)],
 	})
 }
 
-/** Saves button customization. */
+/** Saves button label and emoji to MongoDB. */
 async function handleButtonModal(interaction, guildId) {
 	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
 
@@ -379,8 +388,10 @@ async function handleButtonModal(interaction, guildId) {
 	const emoji = interaction.fields.getTextInputValue("emoji").trim()
 
 	const config = await GuildConfig.getOrCreate(guildId)
+	const existing = config.ticketPanel?.toObject?.() ?? {}
+
 	config.ticketPanel = {
-		...(config.ticketPanel ?? {}),
+		...existing,
 		buttonLabel: label,
 		buttonEmoji: emoji || DEFAULTS.buttonEmoji,
 	}
@@ -392,30 +403,25 @@ async function handleButtonModal(interaction, guildId) {
 	})
 }
 
-/** Saves log channel ID. */
-async function handleLogModal(interaction, guildId) {
+/**
+ * Handles the ChannelSelectMenu submission.
+ *
+ * interaction.channels is a Collection of the selected channels.
+ * We take the first (only one is selected here) and save its ID.
+ */
+async function handleChannelSelect(interaction, guildId) {
 	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
 
-	const channelId = interaction.fields
-		.getTextInputValue("channel_id")
-		.trim()
-		.replace(/[<#>]/g, "")
+	const channel = interaction.channels.first()
 
-	const channel =
-		interaction.guild.channels.cache.get(channelId) ??
-		(await interaction.guild.channels.fetch(channelId).catch(() => null))
-
-	if (!channel?.isTextBased()) {
-		return interaction.editReply({
-			content: "❌ Channel not found or is not a text channel.",
-		})
+	if (!channel) {
+		return interaction.editReply({ content: "❌ No channel selected." })
 	}
 
 	const config = await GuildConfig.getOrCreate(guildId)
-	config.ticketPanel = {
-		...(config.ticketPanel ?? {}),
-		logChannelId: channel.id,
-	}
+	const existing = config.ticketPanel?.toObject?.() ?? {}
+
+	config.ticketPanel = { ...existing, logChannelId: channel.id }
 	config.markModified("ticketPanel")
 	await config.save()
 
@@ -424,59 +430,57 @@ async function handleLogModal(interaction, guildId) {
 	})
 }
 
-// ─── Publish handler ──────────────────────────────────────────────────────────
-
 /**
  * Publishes the configured ticket panel to the current channel.
  *
- * Reads the stored ticketPanel config (or uses defaults for unset fields)
- * and posts a public message with the customized embed and ticket button.
+ * Critical fix: always fetches config fresh from DB here.
+ * The previous version reused a stale `config` reference from execute(),
+ * which did not reflect changes made after the setup panel was first sent.
  *
- * The published message is permanent and public — the ephemeral setup panel
- * is separate and only visible to the admin.
+ * Also calls toObject() on the subdocument before reading fields to avoid
+ * Mongoose subdocument quirks where getters return undefined on nested paths.
  */
 async function handlePublish(interaction, guildId) {
 	await interaction.deferReply({ flags: MessageFlags.Ephemeral })
 
+	// Always fetch fresh — config may have changed since the panel was opened
 	const config = await GuildConfig.getOrCreate(guildId)
-	const panel = config.ticketPanel ?? {}
+	const panel = config.ticketPanel?.toObject?.() ?? config.ticketPanel ?? {}
 
 	const color = hexToInt(panel.color) ?? DEFAULTS.color
+	const title = panel.title || DEFAULTS.title
+	const description = panel.description || DEFAULTS.description
+	const buttonLabel = panel.buttonLabel || DEFAULTS.buttonLabel
+	const buttonEmoji = panel.buttonEmoji || DEFAULTS.buttonEmoji
 
 	const publishedEmbed = new EmbedBuilder()
-		.setTitle(panel.title ?? DEFAULTS.title)
-		.setDescription(panel.description ?? DEFAULTS.description)
+		.setTitle(title)
+		.setDescription(description)
 		.setColor(color)
 		.setTimestamp()
 
 	const openButton = new ButtonBuilder()
 		.setCustomId("open_ticket")
-		.setLabel(panel.buttonLabel ?? DEFAULTS.buttonLabel)
+		.setLabel(buttonLabel)
 		.setStyle(ButtonStyle.Primary)
 
-	// Apply emoji — may be Unicode (string) or a Discord custom emoji (partial object)
-	const emoji = panel.buttonEmoji ?? DEFAULTS.buttonEmoji
-	if (emoji) {
+	if (buttonEmoji) {
 		try {
-			openButton.setEmoji(emoji)
+			openButton.setEmoji(buttonEmoji)
 		} catch {
-			// Invalid emoji format — skip rather than crash the publish
-			console.warn("[Ticket Setup] Invalid button emoji, skipping:", emoji)
+			console.warn("[Ticket Setup] Invalid button emoji, skipping:", buttonEmoji)
 		}
 	}
 
 	const actionRow = new ActionRowBuilder().addComponents(openButton)
 
-	// Post to the channel where the admin ran the command
 	await interaction.channel.send({
 		embeds: [publishedEmbed],
 		components: [actionRow],
 	})
 
 	await interaction.editReply({
-		content: `✅ Ticket panel published successfully in ${interaction.channel}!`,
-		embeds: [],
-		components: [],
+		content: `✅ Ticket panel published in ${interaction.channel}!`,
 	})
 }
 
@@ -484,16 +488,13 @@ async function handlePublish(interaction, guildId) {
 
 /**
  * Converts a hex color string (e.g. "#5865F2") to an integer (0x5865F2).
- * Returns null if the input is not a valid hex color.
- *
- * Discord.js EmbedBuilder.setColor() accepts integers — not hex strings.
+ * EmbedBuilder.setColor() requires an integer, not a string.
  *
  * @param {string|null|undefined} hex
  * @returns {number|null}
  */
 function hexToInt(hex) {
 	if (!hex) return null
-	const cleaned = hex.replace("#", "")
-	const int = Number.parseInt(cleaned, 16)
+	const int = Number.parseInt(hex.replace("#", ""), 16)
 	return Number.isNaN(int) ? null : int
 }

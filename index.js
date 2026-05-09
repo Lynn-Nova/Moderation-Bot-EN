@@ -433,9 +433,10 @@ function registerEventHandlers(client) {
 				return await handleAutoModSetupInteraction(interaction)
 			}
 
-			// Route Ticket setup interactions (Select Menus + Modals + Publish button prefixed with tks_)
+			// Route Ticket setup interactions (Select Menus + Channel Select + Modals + Publish button)
 			if (
 				(interaction.isStringSelectMenu() ||
+					interaction.isChannelSelectMenu() ||
 					interaction.isModalSubmit() ||
 					(interaction.isButton() && interaction.customId === PUBLISH_BTN_ID)) &&
 				interaction.customId?.startsWith("tks_")
